@@ -13,13 +13,23 @@ VERSION_FILE="/data/.paper_source"
 echo "Resolving Paper version (MC_VERSION=${MC_VERSION:-latest})..."
 
 if [ "${MC_VERSION:-latest}" = "latest" ]; then
-  version="$(curl -fsSL --retry 3 -H "User-Agent: $UA" "$API/projects/$PROJECT" | jq -r '.versions | to_entries[0] | .value[0]')"
+  echo "Scanning API for the newest version with ${PAPER_CHANNEL:-STABLE} builds..."
+  versions=$(curl -fsSL --retry 3 -H "User-Agent: $UA" "$API/projects/$PROJECT" | jq -r '.versions[][]')
+  version=""
+  for v in $versions; do
+    builds_count=$(curl -fsSL --retry 3 -H "User-Agent: $UA" "$API/projects/$PROJECT/versions/$v/builds" | jq -r --arg ch "${PAPER_CHANNEL:-STABLE}" '[.[] | select(.channel == $ch)] | length')
+    if [ -n "$builds_count" ] && [ "$builds_count" -gt 0 ]; then
+      version="$v"
+      echo "Success: Found stable builds for Minecraft $version."
+      break
+    fi
+  done
 else
   version="$MC_VERSION"
 fi
 
-if [ -z "$version" ] || [ "$version" = "null" ]; then
-  echo "ERROR: Could not resolve a Minecraft version from the Fill API." >&2
+if [ -z "${version:-}" ] || [ "$version" = "null" ]; then
+  echo "ERROR: Could not resolve a Minecraft version from the API that has stable builds." >&2
   exit 1
 fi
 
