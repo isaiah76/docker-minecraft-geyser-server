@@ -1,0 +1,116 @@
+name: Smoke test
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - scripts/**
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mc_version: ["latest", "1.21.10"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t smoke-test:local .
+
+      - name: Start server (MC_VERSION=${{ matrix.mc_version }})
+        run: |
+          docker run -d \
+            --name smoke \
+            -e EULA=true \
+            -e MEMORY=1536M \
+            -e MC_VERSION="${{ matrix.mc_version }}" \
+            -e MOTD="CI smoke test (${{ matrix.mc_version }})" \
+            -p 25565:25565 \
+            -p 19132:19132/udp \
+            smoke-test:local
+
+      - name: Wait for Paper to finish starting
+        run: |
+          timeout=300
+          elapsed=0
+          until docker logs smoke 2>&1 | grep -q "Done ("; do
+            if [ "$elapsed" -ge "$timeout" ]; then
+              echo "::error::Server did not finish starting within ${timeout}s"
+              docker logs smoke
+              exit 1
+            fi
+            # Bail out early and loudly if the JVM already died - this is
+            # exactly the case a Java/Minecraft version mismatch hits.
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
+              echo "::error::Container exited early (possible Java/Minecraft version mismatch - check the compatibility check's message below)"
+              docker logs smoke
+              exit 1
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+          done
+          echo "Server started after ~${elapsed}s"
+
+      - name: Verify plugin jars downloaded
+        run: |
+          missing=0
+          for jar in Geyser-Spigot.jar floodgate-spigot.jar Hurricane.jar; do
+            size=$(docker exec smoke sh -c "stat -c %s /data/plugins/$jar 2>/dev/null || echo 0")
+            if [ "$size" -lt 1000 ]; then
+              echo "::error::$jar missing or suspiciously small (${size} bytes)"
+              missing=1
+            else
+              echo "OK: $jar (${size} bytes)"
+            fi
+          done
+          # GeyserSkinManager is best-effort/non-fatal by design (see download-plugins.sh),
+          # so only warn, don't fail the job, if it didn't land.
+          sm_size=$(docker exec smoke sh -c "stat -c %s /data/plugins/GeyserSkinManager-Spigot.jar 2>/dev/null || echo 0")
+          if [ "$sm_size" -lt 1000 ]; then
+            echo "::warning::GeyserSkinManager-Spigot.jar missing or small (${sm_size} bytes) - non-fatal, but worth a look"
+          else
+            echo "OK: GeyserSkinManager-Spigot.jar (${sm_size} bytes)"
+          fi
+          exit $missing
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f smoke || true
+
+      - name: Open an issue if the scheduled run failed
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const label = "smoke-test-failure";
+            const mcVersion = "${{ matrix.mc_version }}";
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+            });
+            if (existing.some(i => i.title.includes(mcVersion))) {
+              console.log(`An open smoke-test-failure issue for ${mcVersion} already exists, not creating another.`);
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Scheduled smoke test failed (MC_VERSION=${mcVersion})`,
+              labels: [label],
+              body: `The daily smoke test failed for MC_VERSION=${mcVersion}. This usually means one of the upstream APIs (PaperMC Fill, GeyserMC downloads, or GitHub releases) changed shape, an asset name moved, or - if this is the "latest" leg - a new Minecraft release needs a newer Java than this image ships (check the compatibility table in scripts/common.sh and the JAVA_VERSION build arg).\n\nSee the run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });

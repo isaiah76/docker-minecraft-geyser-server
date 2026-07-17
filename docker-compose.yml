@@ -1,0 +1,18 @@
+services:
+  minecraft:
+    build:
+      context: .
+      args:
+        JAVA_VERSION: ${JAVA_VERSION:-25}
+    container_name: minecraft-server
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-25565}:${SERVER_PORT:-25565}/tcp"
+      - "${GEYSER_PORT:-19132}:${GEYSER_PORT:-19132}/udp"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true
+    stop_grace_period: 60s
